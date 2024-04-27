@@ -5,7 +5,7 @@ import numpy as np
 
 import random
 import itertools
-from typing import List, Tuple, TypedDict
+from typing import List, Tuple, TypedDict, Literal
 import tqdm
 
 stop_loop = 10
@@ -131,6 +131,7 @@ class DataGenerator:
 				img_color: Tuple[int, int, int],
 				object_per_image: int,
 				n: int,
+				obj_coords: bool = False,
 		) -> List[Tuple[np.ndarray, np.ndarray]]:
 				"""
 				Inserts objects into images and generates versions with and without mesh overlays.
@@ -160,9 +161,11 @@ class DataGenerator:
 				object_per_image = min(object_per_image, n_chunk_height * n_chunk_width)
 
 				result = []
+				coords = []
+				
 
 
-				for _ in tqdm.tqdm(range(n), desc="Generating images"):
+				for _ in tqdm.tqdm(range(n), desc=f"Generating images in {img_color} color... "):
 						copied_img_no_mesh = img_template.copy()
 						copied_img_full_mesh = img_template.copy()
 						# sample obj respect by object_per_image and not overlap
@@ -197,6 +200,8 @@ class DataGenerator:
 												if placed == object_per_image:
 														break
 						result.append((copied_img_no_mesh, copied_img_full_mesh))
+						if obj_coords:
+								coords.append((x, y))
 
 				return result
 
@@ -219,3 +224,6 @@ class GenerateParams(TypedDict):
 		crab_flip: bool
 		object_flip_h: bool
 		object_flip_v: bool
+
+class CoordParams(TypedDict):
+		format: Literal

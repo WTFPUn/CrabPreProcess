@@ -5,167 +5,245 @@ import torch.nn.functional as F
 from typing import List
 
 
-class Encoder(nn.Module):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-    def __init__(
-        self, input_dim, hidden_dim, output_dim, kernel_size=(4, 4, 3, 1), stride=2
-    ):
-        super(Encoder, self).__init__()
+class VectorQuantizer(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost):
+        super(VectorQuantizer, self).__init__()
+        
+        self._embedding_dim = embedding_dim
+        self._num_embeddings = num_embeddings
+        
+        self._embedding = nn.Embedding(self._num_embeddings, self._embedding_dim)
+        self._embedding.weight.data.uniform_(-1/self._num_embeddings, 1/self._num_embeddings)
+        self._commitment_cost = commitment_cost
 
-        kernel_1, kernel_2, kernel_3, kernel_4 = kernel_size
-
-        self.strided_conv_1 = nn.Conv2d(
-            input_dim, hidden_dim, kernel_1, stride, padding=1
-        )
-        self.strided_conv_2 = nn.Conv2d(
-            hidden_dim, hidden_dim, kernel_2, stride, padding=1
-        )
-
-        self.residual_conv_1 = nn.Conv2d(hidden_dim, hidden_dim, kernel_3, padding=1)
-        self.residual_conv_2 = nn.Conv2d(hidden_dim, hidden_dim, kernel_4, padding=0)
-
-        self.proj = nn.Conv2d(hidden_dim, output_dim, kernel_size=1)
-
-    def forward(self, x):
-
-        x = self.strided_conv_1(x)
-        x = self.strided_conv_2(x)
-
-        x = F.relu(x)
-        y = self.residual_conv_1(x)
-        y = y + x
-
-        x = F.relu(y)
-        y = self.residual_conv_2(x)
-        y = y + x
-
-        y = self.proj(y)
-        return y
-
-
-class VQEmbeddingEMA(nn.Module):
-    def __init__(
-        self,
-        n_embeddings,
-        embedding_dim,
-        commitment_cost=0.25,
-        decay=0.999,
-        epsilon=1e-5,
-    ):
-        super(VQEmbeddingEMA, self).__init__()
-        self.commitment_cost = commitment_cost
-        self.decay = decay
-        self.epsilon = epsilon
-
-        init_bound = 1 / n_embeddings
-        embedding = torch.Tensor(n_embeddings, embedding_dim)
-        embedding.uniform_(-init_bound, init_bound)
-        self.register_buffer("embedding", embedding)
-        self.register_buffer("ema_count", torch.zeros(n_embeddings))
-        self.register_buffer("ema_weight", self.embedding.clone())
-
-    def encode(self, x):
-        M, D = self.embedding.size()
-        x_flat = x.detach().reshape(-1, D)
-
-        distances = (-torch.cdist(x_flat, self.embedding, p=2)) ** 2
-
-        indices = torch.argmin(distances.float(), dim=-1)
-        quantized = F.embedding(indices, self.embedding)
-        quantized = quantized.view_as(x)
-        return quantized, indices.view(x.size(0), x.size(1))
-
-    def retrieve_random_codebook(self, random_indices):
-        quantized = F.embedding(random_indices, self.embedding)
-        quantized = quantized.transpose(1, 3)
-
-        return quantized
-
-    def forward(self, x):
-        M, D = self.embedding.size()
-        x_flat = x.detach().reshape(-1, D)
-
-        distances = (-torch.cdist(x_flat, self.embedding, p=2)) ** 2
-
-        indices = torch.argmin(distances.float(), dim=-1)
-        encodings = F.one_hot(indices, M).float()
-        quantized = F.embedding(indices, self.embedding)
-        quantized = quantized.view_as(x)
-
-        if self.training:
-            self.ema_count = self.decay * self.ema_count + (1 - self.decay) * torch.sum(
-                encodings, dim=0
-            )
-            n = torch.sum(self.ema_count)
-            self.ema_count = (
-                (self.ema_count + self.epsilon) / (n + M * self.epsilon) * n
-            )
-
-            dw = torch.matmul(encodings.t(), x_flat)
-            self.ema_weight = self.decay * self.ema_weight + (1 - self.decay) * dw
-            self.embedding = self.ema_weight / self.ema_count.unsqueeze(-1)
-
-        codebook_loss = F.mse_loss(x.detach(), quantized)
-        e_latent_loss = F.mse_loss(x, quantized.detach())
-        commitment_loss = self.commitment_cost * e_latent_loss
-
-        quantized = x + (quantized - x).detach()
-
+    def forward(self, inputs):
+        # convert inputs from BCHW -> BHWC
+        inputs = inputs.permute(0, 2, 3, 1).contiguous()
+        input_shape = inputs.shape
+        
+        # Flatten input
+        flat_input = inputs.view(-1, self._embedding_dim)
+        
+        # Calculate distances
+        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
+                    + torch.sum(self._embedding.weight**2, dim=1)
+                    - 2 * torch.matmul(flat_input, self._embedding.weight.t()))
+            
+        # Encoding
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        encodings = torch.zeros(encoding_indices.shape[0], self._num_embeddings, device=inputs.device)
+        encodings.scatter_(1, encoding_indices, 1)
+        
+        # Quantize and unflatten
+        quantized = torch.matmul(encodings, self._embedding.weight).view(input_shape)
+        
+        # Loss
+        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
+        q_latent_loss = F.mse_loss(quantized, inputs.detach())
+        loss = q_latent_loss + self._commitment_cost * e_latent_loss
+        
+        quantized = inputs + (quantized - inputs).detach()
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        
+        # convert quantized from BHWC -> BCHW
+        return loss, quantized.permute(0, 3, 1, 2).contiguous(), perplexity, encodings
+    
+class VectorQuantizerEMA(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost, decay, epsilon=1e-5):
+        super(VectorQuantizerEMA, self).__init__()
+        
+        self._embedding_dim = embedding_dim
+        self._num_embeddings = num_embeddings
+        
+        self._embedding = nn.Embedding(self._num_embeddings, self._embedding_dim)
+        self._embedding.weight.data.normal_()
+        self._commitment_cost = commitment_cost
+        
+        self.register_buffer('_ema_cluster_size', torch.zeros(num_embeddings))
+        self._ema_w = nn.Parameter(torch.Tensor(num_embeddings, self._embedding_dim))
+        self._ema_w.data.normal_()
+        
+        self._decay = decay
+        self._epsilon = epsilon
 
-        return quantized, commitment_loss, codebook_loss, perplexity
+    def forward(self, inputs):
+        # convert inputs from BCHW -> BHWC
+        # reshape from [B,H,W]
+        inputs = inputs.permute(0, 2, 3, 1).contiguous()
+        input_shape = inputs.shape
+        
+        # Flatten input
+        flat_input = inputs.view(-1, self._embedding_dim)
+        
+        # Calculate distances
+        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
+                    + torch.sum(self._embedding.weight**2, dim=1)
+                    - 2 * torch.matmul(flat_input, self._embedding.weight.t()))
+            
+        # Encoding
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        encodings = torch.zeros(encoding_indices.shape[0], self._num_embeddings, device=inputs.device)
+        encodings.scatter_(1, encoding_indices, 1)
+        
+        # Quantize and unflatten
+        quantized = torch.matmul(encodings, self._embedding.weight).view(input_shape)
+        
+        # Use EMA to update the embedding vectors
+        if self.training:
+            self._ema_cluster_size = self._ema_cluster_size * self._decay + \
+                                     (1 - self._decay) * torch.sum(encodings, 0)
+            
+            # Laplace smoothing of the cluster size
+            n = torch.sum(self._ema_cluster_size.data)
+            self._ema_cluster_size = (
+                (self._ema_cluster_size + self._epsilon)
+                / (n + self._num_embeddings * self._epsilon) * n)
+            
+            dw = torch.matmul(encodings.t(), flat_input)
+            self._ema_w = nn.Parameter(self._ema_w * self._decay + (1 - self._decay) * dw)
+            
+            self._embedding.weight = nn.Parameter(self._ema_w / self._ema_cluster_size.unsqueeze(1))
+        
+        # Loss
+        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
+        loss = self._commitment_cost * e_latent_loss
+        
+        # Straight Through Estimator
+        quantized = inputs + (quantized - inputs).detach()
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        
+        # convert quantized from BHWC -> BCHW
+        return loss, quantized.permute(0, 3, 1, 2).contiguous(), perplexity, encodings
 
-
-class Decoder(nn.Module):
-
-    def __init__(
-        self, input_dim, hidden_dim, output_dim, kernel_sizes=(1, 3, 2, 2), stride=2
-    ):
-        super(Decoder, self).__init__()
-
-        kernel_1, kernel_2, kernel_3, kernel_4 = kernel_sizes
-
-        self.in_proj = nn.Conv2d(input_dim, hidden_dim, kernel_size=1)
-
-        self.residual_conv_1 = nn.Conv2d(hidden_dim, hidden_dim, kernel_1, padding=0)
-        self.residual_conv_2 = nn.Conv2d(hidden_dim, hidden_dim, kernel_2, padding=1)
-
-        self.strided_t_conv_1 = nn.ConvTranspose2d(
-            hidden_dim, hidden_dim, kernel_3, stride, padding=0
+class Residual(nn.Module):
+    def __init__(self, in_channels, num_hiddens, num_residual_hiddens):
+        super(Residual, self).__init__()
+        self._block = nn.Sequential(
+            nn.ReLU(True),
+            nn.Conv2d(in_channels=in_channels,
+                      out_channels=num_residual_hiddens,
+                      kernel_size=3, stride=1, padding=1, bias=False),
+            nn.ReLU(True),
+            nn.Conv2d(in_channels=num_residual_hiddens,
+                      out_channels=num_hiddens,
+                      kernel_size=1, stride=1, bias=False)
         )
-        self.strided_t_conv_2 = nn.ConvTranspose2d(
-            hidden_dim, output_dim, kernel_4, stride, padding=0
-        )
+    
+    def forward(self, x):
+        return x + self._block(x)
+
+
+class ResidualStack(nn.Module):
+    def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens):
+        super(ResidualStack, self).__init__()
+        self._num_residual_layers = num_residual_layers
+        self._layers = nn.ModuleList([Residual(in_channels, num_hiddens, num_residual_hiddens)
+                             for _ in range(self._num_residual_layers)])
 
     def forward(self, x):
+        for i in range(self._num_residual_layers):
+            x = self._layers[i](x)
+        return F.relu(x)
 
-        x = self.in_proj(x)
+class Encoder(nn.Module):
+    def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens):
+        super(Encoder, self).__init__()
 
-        y = self.residual_conv_1(x)
-        y = y + x
-        x = F.relu(y)
+        self._conv_1 = nn.Conv2d(in_channels=in_channels,
+                                 out_channels=num_hiddens//2,
+                                 kernel_size=4,
+                                 stride=2, padding=1)
+        self._conv_2 = nn.Conv2d(in_channels=num_hiddens//2,
+                                 out_channels=num_hiddens,
+                                 kernel_size=4,
+                                 stride=2, padding=1)
+        self._conv_3 = nn.Conv2d(in_channels=num_hiddens,
+                                 out_channels=num_hiddens,
+                                 kernel_size=3,
+                                 stride=1, padding=1)
+        self._residual_stack = ResidualStack(in_channels=num_hiddens,
+                                             num_hiddens=num_hiddens,
+                                             num_residual_layers=num_residual_layers,
+                                             num_residual_hiddens=num_residual_hiddens)
 
-        y = self.residual_conv_2(x)
-        y = y + x
-        y = F.relu(y)
+    def forward(self, inputs):
+        x = self._conv_1(inputs)
+        x = F.relu(x)
+        
+        x = self._conv_2(x)
+        x = F.relu(x)
+        
+        x = self._conv_3(x)
+        return self._residual_stack(x)
+    
+class Decoder(nn.Module):
+    def __init__(self, in_channels, num_hiddens, num_residual_layers, num_residual_hiddens):
+        super(Decoder, self).__init__()
+        
+        self._conv_1 = nn.Conv2d(in_channels=in_channels,
+                                 out_channels=num_hiddens,
+                                 kernel_size=3, 
+                                 stride=1, padding=1)
+        
+        self._residual_stack = ResidualStack(in_channels=num_hiddens,
+                                             num_hiddens=num_hiddens,
+                                             num_residual_layers=num_residual_layers,
+                                             num_residual_hiddens=num_residual_hiddens)
+        
+        self._conv_trans_1 = nn.ConvTranspose2d(in_channels=num_hiddens, 
+                                                out_channels=num_hiddens//2,
+                                                kernel_size=4, 
+                                                stride=2, padding=1)
+        
+        self._conv_trans_2 = nn.ConvTranspose2d(in_channels=num_hiddens//2, 
+                                                out_channels=3,
+                                                kernel_size=4, 
+                                                stride=2, padding=1)
 
-        y = self.strided_t_conv_1(y)
-        y = self.strided_t_conv_2(y)
-
-        return y
-
+    def forward(self, inputs):
+        x = self._conv_1(inputs)
+        
+        x = self._residual_stack(x)
+        
+        x = self._conv_trans_1(x)
+        x = F.relu(x)
+        
+        return self._conv_trans_2(x)
+    
 
 class VQVAE(nn.Module):
-    def __init__(self, Encoder, Codebook, Decoder):
+    def __init__(self, num_hiddens, num_residual_layers, num_residual_hiddens, 
+                 num_embeddings, embedding_dim, commitment_cost, decay=0):
         super(VQVAE, self).__init__()
-        self.encoder = Encoder
-        self.codebook = Codebook
-        self.decoder = Decoder
+        
+        self._encoder = Encoder(3, num_hiddens,
+                                num_residual_layers, 
+                                num_residual_hiddens)
+        self._pre_vq_conv = nn.Conv2d(in_channels=num_hiddens, 
+                                      out_channels=embedding_dim,
+                                      kernel_size=1, 
+                                      stride=1)
+        if decay > 0.0:
+            self._vq_vae = VectorQuantizerEMA(num_embeddings, embedding_dim, 
+                                              commitment_cost, decay)
+        else:
+            self._vq_vae = VectorQuantizer(num_embeddings, embedding_dim,
+                                           commitment_cost)
+        self._decoder = Decoder(embedding_dim,
+                                num_hiddens, 
+                                num_residual_layers, 
+                                num_residual_hiddens)
 
     def forward(self, x):
-        z = self.encoder(x)
-        z_quantized, commitment_loss, codebook_loss, perplexity = self.codebook(z)
-        x_hat = self.decoder(z_quantized)
+        z = self._encoder(x)
+        z = self._pre_vq_conv(z)
+        loss, quantized, perplexity, _ = self._vq_vae(z)
+        x_recon = self._decoder(quantized)
 
-        return x_hat, commitment_loss, codebook_loss, perplexity
+        return loss, x_recon, perplexity
